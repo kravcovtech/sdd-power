@@ -39,6 +39,7 @@ A few decisions that separate this from "keep a TODO file":
 - **The strongest consolidation is turning a rule into a check.** What a test, a linter, or CI can catch shouldn't live as text betting on a future session's memory.
 - **The documentation snapshot is dated.** Docs changed — re-sync the plan, don't work from memory.
 - **Scope is held.** Duplication and dead code noticed along the way become tasks in PLAN.md, not part of the current diff. The exception is a finding that physically blocks the task.
+- **The infrastructure repairs itself.** A project started with an earlier version of the skill is silently brought up to the current one on the next run: files move into `docs/sdd-power/`, `stages/`, the CLAUDE.md pointer line, and the `.gitignore` entry are added. Old entries are never rewritten.
 
 ## What it doesn't do
 

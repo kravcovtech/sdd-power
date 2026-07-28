@@ -1,6 +1,6 @@
 ---
 name: sdd-power
-description: "Discipline for long-running development against existing project documentation, with persistent tracking (PLAN.md, WORKLOG.md, TIMELINE.md, LESSONS.md in docs/sdd-power/) and critical verification of the documentation itself. Use ALWAYS when the user says \"start development from the docs\", \"build according to the documentation\", \"continue development\", \"where did we leave off\", \"what's done and what's left\", \"check against the plan\", \"update the plan and log\", \"record progress\", \"pick up where we stopped\", \"keep a development plan\", \"I need a development timeline\"; mentions PLAN.md, WORKLOG.md, TIMELINE.md, LESSONS.md or the docs/sdd-power directory; complains that the project documentation contains errors or diverges from the code; or begins multi-step work that will span several sessions. Also trigger whenever the project already contains a docs/sdd-power directory — even if the user never mentions tracking. Do NOT use for one-off small fixes that fit in a single session."
+description: "Discipline for long-running development against existing project documentation, with persistent tracking (PLAN.md, WORKLOG.md, TIMELINE.md, LESSONS.md in docs/sdd-power/) and critical verification of the documentation itself. Use ALWAYS when the user says \"start development from the docs\", \"continue development\", \"where did we leave off\", \"what's done and what's left\", \"check against the plan\", \"update the plan and log\", \"record progress\", \"pick up where we stopped\", \"keep a development plan/timeline\"; mentions PLAN.md, WORKLOG.md, TIMELINE.md, LESSONS.md or the docs/sdd-power directory; complains that the project documentation contains errors or diverges from the code; or begins multi-step work that will span several sessions. Also trigger without any explicit mention of tracking if the project contains docs/sdd-power or PLAN.md and WORKLOG.md files (including at the root — a trace of an older version of the skill). Do NOT use for one-off small fixes that fit in a single session."
 ---
 
 # SDD Power
@@ -64,6 +64,14 @@ Development state lives in docs/sdd-power/ (PLAN, WORKLOG, TIMELINE, LESSONS, st
 ## Continuation mode
 
 At the start of **every** session, before any code:
+
+0. **Bring the infrastructure up to the current version of the skill.** The project may have been initialized by an earlier version, when parts of the system didn't exist yet. Check and silently repair whatever is missing (this step is idempotent — on an up-to-date project it does nothing):
+   - the tracking files sit at the project root or somewhere else — move them into `docs/sdd-power/`;
+   - no `docs/sdd-power/stages/` — create it;
+   - no pointer line in CLAUDE.md — add it (without it the skill won't be picked up next session — this is the main anchor);
+   - no `docs/sdd-power/` entry in `.gitignore` while git is in use — add it;
+   - the files lack fields from the current templates (for example "Commit", "Verified", "Stage DoD") — don't rewrite old entries, just keep new ones to the current template.
+   Repaired something — one WORKLOG entry about the migration, with the list.
 
 1. Read PLAN.md, TIMELINE.md, and LESSONS.md in full, plus the top entries of WORKLOG.md. For closed stages read `stages/<ID>.md` rather than the worklog feed for those days — that's what the summary is for.
 2. **Reconcile them with the actual state of the code.** The files can lie: work may have been done by hand, without you. Found a discrepancy — bring the files up to date first, note it in WORKLOG.md, and only then continue.
