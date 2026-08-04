@@ -2,6 +2,8 @@
 
 *[Русская версия](README.md)*
 
+> **Note:** the English skill in `en/` currently corresponds to version 2. The Russian version at the repository root is at version 3, which adds an executable helper script (`scripts/sdd.sh`), a tracking validator, and hash-based documentation-drift detection — see [CHANGELOG.md](CHANGELOG.md). The English translation of v3 is in progress; everything described below still holds, minus the tooling.
+
 A Claude Code skill: discipline for long-running development against existing project documentation — with persistent state tracking and critical verification of the documentation itself.
 
 It's for work that doesn't fit in a single session: the agent comes back to the project a week later with an empty context and has to understand within a minute what's done, what's left, and why a particular decision was made.
