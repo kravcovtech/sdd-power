@@ -1,351 +1,407 @@
 #!/usr/bin/env bash
-# sdd-power: инфраструктура трекинга, проверка её целостности и содержания.
-# Идемпотентен: существующие файлы никогда не перезаписываются.
+# sdd-power — инфраструктура и валидатор трекинга разработки.
 #
-#   sdd.sh init          [--root DIR] [--name "Проект"] [--gitignore]
-#   sdd.sh check         [--root DIR]        инфраструктура + дрейф доки + валидатор (сводка)
-#   sdd.sh validate      [--root DIR]        полный разбор файлов трекинга
-#   sdd.sh next          [--root DIR]        где остановились и что следующее
-#   sdd.sh snapshot      [--root DIR] [--docs "путь ..."]   зафиксировать снимок документации
-#   sdd.sh stage <ID> <slug>                 заготовка саммари закрытого этапа
-#   sdd.sh archive-tasks <ID>                перенести состав закрытого этапа из PLAN в саммари
+# Команды:
+#   init [--name NAME] [--root DIR] [--gitignore]   развернуть/подобрать трекинг, поставить якорь
+#   check [--root DIR]                              инфраструктура + дрейф доки + ошибки трекинга
+#   next [--root DIR]                               текущий этап, DoD, прогресс, следующая задача
+#   validate [--root DIR]                           полный разбор содержания файлов трекинга
+#   snapshot --docs "f1 f2 ..." [--root DIR]        зафиксировать снимок документации
+#   stage <ID> <slug> [--root DIR]                  заготовка саммари этапа из шаблона
+#   archive-tasks <ID> [--root DIR]                 перенести состав этапа из PLAN в саммари
 #
-# Коды возврата: 0 — порядок (предупреждения допустимы), 1 — ошибки, 2 — ошибка вызова.
+# Код возврата 0 при успешном разборе аргументов; вердикт — в тексте вывода.
+# Ненулевой код означает только сбой самого скрипта (нет аргумента, нет файла, нет шаблонов).
 
 set -uo pipefail
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SKILL_DIR=$(dirname -- "$SCRIPT_DIR")
 ASSETS="$SKILL_DIR/assets"
-LIB="$SKILL_DIR/scripts/lib"
-TRACKED=(PLAN WORKLOG TIMELINE LESSONS)
-ANCHOR_MARK="<!-- sdd-power -->"
-GITIGNORE=0; NAME=""; ROOT=""; DOCS_ARG=""
 
-die() { printf '✗ %s\n' "$*" >&2; exit 2; }
-say() { printf '%s\n' "$*"; }
+CMD=${1:-help}
+[ $# -gt 0 ] && shift
 
-# ---------- аргументы ----------
-CMD="${1:-help}"; shift || true
-ARG1=""; ARG2=""
-case "$CMD" in
-  stage|archive-tasks)
-    [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && { ARG1="$1"; shift; }
-    [ $# -gt 0 ] && [ "${1#--}" = "$1" ] && { ARG2="$1"; shift; }
-    ;;
-esac
+ROOT=""
+NAME=""
+DOCS_ARG=""
+GITIGNORE=0
+POS=()
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --root) ROOT="${2:-}"; shift 2 ;;
-    --name) NAME="${2:-}"; shift 2 ;;
-    --docs) DOCS_ARG="${2:-}"; shift 2 ;;
+    --root) ROOT=${2:-}; shift 2 ;;
+    --name) NAME=${2:-}; shift 2 ;;
+    --docs) DOCS_ARG=${2:-}; shift 2 ;;
     --gitignore) GITIGNORE=1; shift ;;
-    *) die "неизвестный аргумент: $1" ;;
+    -h|--help) CMD=help; shift ;;
+    *) POS+=("$1"); shift ;;
   esac
 done
 
-# ---------- корень и пути ----------
-[ -n "$ROOT" ] || ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-[ -d "$ROOT" ] || die "корень проекта не найден: $ROOT"
-ROOT="$(cd "$ROOT" && pwd)"
+if [ -z "$ROOT" ]; then
+  ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || ROOT=""
+  [ -n "$ROOT" ] || ROOT=$PWD
+fi
+
 SDD="$ROOT/docs/sdd-power"
-CFG="$SDD/config.yml"
+PLAN="$SDD/PLAN.md"
+WORKLOG="$SDD/WORKLOG.md"
+TIMELINE="$SDD/TIMELINE.md"
+LESSONS="$SDD/LESSONS.md"
+STAGES="$SDD/stages"
+CONFIG="$SDD/config.yml"
 LOCK="$SDD/docs.lock"
-[ -d "$ASSETS" ] || die "шаблоны не найдены: $ASSETS"
 
-cfg_get() { [ -f "$CFG" ] && sed -n "s/^$1:[[:space:]]*//p" "$CFG" | head -1 || true; }
-cfg_set() {
-  [ -f "$CFG" ] || return 1
-  if grep -q "^$1:" "$CFG"; then
-    awk -v k="$1" -v v="$2" '{ if (index($0, k ":") == 1) print k ": " v; else print }' "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
-  else
-    printf '%s: %s\n' "$1" "$2" >> "$CFG"
+TRACK_FILES="PLAN.md WORKLOG.md TIMELINE.md LESSONS.md"
+ANCHOR_OPEN="<!-- sdd-power -->"
+ANCHOR_CLOSE="<!-- /sdd-power -->"
+
+# die — сбой вызова (нет аргумента, нет шаблона): stderr, код 2.
+# refuse — штатный отказ по состоянию проекта: stdout, код 0, с подсказкой следующего шага.
+die()    { printf '%s\n' "$*" >&2; exit 2; }
+refuse() { printf '%s\n' "$*"; exit 0; }
+
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else echo "no-sha256"; fi
+}
+
+today() { date +%Y-%m-%d; }
+now()   { date "+%Y-%m-%d %H:%M"; }
+
+# --- поиск файлов трекинга от прежних версий скилла --------------------------
+legacy_dirs() { printf '%s\n' "$ROOT" "$ROOT/docs" "$ROOT/.sdd" "$ROOT/sdd-power"; }
+
+find_legacy() { # $1 = имя файла; печатает первый найденный путь вне docs/sdd-power
+  local f=$1 d
+  while read -r d; do
+    [ -f "$d/$f" ] && [ "$d/$f" != "$SDD/$f" ] && { printf '%s\n' "$d/$f"; return 0; }
+  done < <(legacy_dirs)
+  return 1
+}
+
+anchor_block() {
+  cat <<EOF
+$ANCHOR_OPEN
+## Трекинг разработки (sdd-power)
+
+Состояние проекта живёт в \`docs/sdd-power/\`:
+PLAN.md — что предстоит · WORKLOG.md — что и почему сделано · TIMELINE.md — где мы в целом ·
+LESSONS.md — на чём уже обжигались · stages/ — саммари закрытых этапов.
+
+В начале сессии активируй скилл **sdd-power**, прочитай эти файлы и обновляй их синхронно с кодом.
+$ANCHOR_CLOSE
+EOF
+}
+
+put_anchor() { # $1 = путь к CLAUDE.md / AGENTS.md
+  local f=$1
+  if [ -f "$f" ] && grep -qF "$ANCHOR_OPEN" "$f"; then
+    echo "  якорь уже есть: ${f#$ROOT/}"
+    return
   fi
+  [ -f "$f" ] && printf '\n' >> "$f"
+  anchor_block >> "$f"
+  echo "  якорь добавлен: ${f#$ROOT/}"
 }
-sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
-  elif command -v shasum   >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
-  else printf 'no-sha-tool'; fi
-}
-git_in_root() { git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; }
-have_tracking() { [ -f "$SDD/PLAN.md" ] && [ -f "$SDD/WORKLOG.md" ] && [ -f "$SDD/TIMELINE.md" ] && [ -f "$SDD/LESSONS.md" ]; }
 
-# ---------- init ----------
+# ============================================================ init
 cmd_init() {
-  local created="" migrated="" skipped=""
-  mkdir -p "$SDD/stages" || die "не удалось создать $SDD/stages"
-  [ -e "$SDD/stages/.gitkeep" ] || : > "$SDD/stages/.gitkeep"
+  [ -d "$ASSETS" ] || die "не найден каталог шаблонов: $ASSETS"
+  echo "Корень проекта: $ROOT"
+  mkdir -p "$STAGES" || die "не удалось создать $STAGES"
+  [ -f "$STAGES/.gitkeep" ] || touch "$STAGES/.gitkeep"
 
-  for f in "${TRACKED[@]}"; do
-    local target="$SDD/$f.md" legacy=""
-    if [ -f "$target" ]; then skipped="$skipped $f.md"; continue; fi
-    for cand in "$ROOT/$f.md" "$ROOT/docs/$f.md" "$ROOT/.sdd/$f.md" "$ROOT/sdd-power/$f.md"; do
-      [ -f "$cand" ] && { legacy="$cand"; break; }
-    done
-    if [ -n "$legacy" ]; then
-      if git_in_root && git -C "$ROOT" ls-files --error-unmatch "$legacy" >/dev/null 2>&1; then
-        git -C "$ROOT" mv "$legacy" "$target" >/dev/null 2>&1 || mv "$legacy" "$target"
-      else mv "$legacy" "$target"; fi
-      migrated="$migrated ${legacy#$ROOT/}→$f.md"
+  local f src tpl
+  for f in $TRACK_FILES; do
+    if [ -f "$SDD/$f" ]; then
+      echo "  на месте: docs/sdd-power/$f (не тронут)"
+      continue
+    fi
+    if src=$(find_legacy "$f"); then
+      mv "$src" "$SDD/$f"
+      echo "  подобран из ${src#$ROOT/} → docs/sdd-power/$f  [след старой версии скилла: отметь миграцию в WORKLOG]"
+      continue
+    fi
+    tpl="$ASSETS/${f%.md}.template.md"
+    [ -f "$tpl" ] || die "нет шаблона $tpl"
+    if [ -n "$NAME" ]; then
+      sed "s/<название проекта>/${NAME//\//\\/}/g" "$tpl" > "$SDD/$f"
     else
-      cp "$ASSETS/$f.template.md" "$target" || die "не удалось создать $target"
-      [ -n "$NAME" ] && { NAME="$NAME" perl -pi -e 's/<название проекта>/$ENV{NAME}/g' "$target" 2>/dev/null || true; }
-      created="$created $f.md"
+      cp "$tpl" "$SDD/$f"
+    fi
+    echo "  создан из шаблона: docs/sdd-power/$f"
+  done
+
+  put_anchor "$ROOT/CLAUDE.md"
+  [ -f "$ROOT/AGENTS.md" ] && put_anchor "$ROOT/AGENTS.md"
+
+  if [ "$GITIGNORE" = 1 ]; then
+    if [ -f "$ROOT/.gitignore" ] && grep -qE '^docs/sdd-power/?$' "$ROOT/.gitignore"; then
+      echo "  .gitignore: запись уже есть"
+    else
+      printf 'docs/sdd-power/\n' >> "$ROOT/.gitignore"
+      echo "  .gitignore: добавлено docs/sdd-power/ — файлы не переживут клон и не видны команде"
+    fi
+  fi
+
+  echo
+  echo "Содержимое docs/sdd-power:"
+  (cd "$SDD" && find . -mindepth 1 -maxdepth 2 -not -name '.gitkeep' | sed 's|^\./|  |' | sort)
+  echo
+  echo "Инфраструктура развёрнута. Дальше: заполнить PLAN.md по документации, затем sdd.sh validate."
+}
+
+# ============================================================ общие проверки
+infra_report() { # печатает состояние инфраструктуры; ставит INFRA_OK
+  INFRA_OK=1
+  local f missing=""
+  for f in $TRACK_FILES; do
+    [ -f "$SDD/$f" ] || { missing="$missing $f"; INFRA_OK=0; }
+  done
+  [ -d "$STAGES" ] || { missing="$missing stages/"; INFRA_OK=0; }
+
+  if [ "$INFRA_OK" = 1 ]; then
+    echo "Инфраструктура: на месте (4 файла трекинга + stages/ в docs/sdd-power/)"
+  else
+    echo "Инфраструктура: НЕПОЛНАЯ — отсутствует:$missing → запусти: sdd.sh init"
+  fi
+
+  if [ -f "$ROOT/CLAUDE.md" ] && grep -qF "$ANCHOR_OPEN" "$ROOT/CLAUDE.md"; then
+    echo "Якорь в CLAUDE.md: на месте"
+  else
+    echo "Якорь в CLAUDE.md: ПОТЕРЯН — проект перестанет подхватываться → sdd.sh init"
+    INFRA_OK=0
+  fi
+  if [ -f "$ROOT/AGENTS.md" ] && ! grep -qF "$ANCHOR_OPEN" "$ROOT/AGENTS.md"; then
+    echo "Якорь в AGENTS.md: отсутствует (файл есть) → sdd.sh init"
+  fi
+
+  local leg
+  for f in $TRACK_FILES; do
+    if leg=$(find_legacy "$f"); then
+      echo "Файл вне docs/sdd-power: ${leg#$ROOT/} — след старой версии скилла, перенеси через init и отметь миграцию в WORKLOG"
     fi
   done
+}
 
-  if [ ! -f "$CFG" ]; then
-    cat > "$CFG" <<EOF
-# Машинно-читаемая конфигурация sdd-power. Человеческая шапка — в PLAN.md.
-# docs: пути к файлам документации, по которым строился план (через пробел).
-# snapshot: дата снимка; хеши файлов — в docs.lock, обновляются через 'sdd.sh snapshot'.
-project: ${NAME:-<название проекта>}
-docs:
-snapshot:
-rigor: full
-git: $([ "$GITIGNORE" = 1 ] && echo ignored || echo tracked)
-EOF
-    created="$created config.yml"
+docs_drift() {
+  if [ ! -f "$LOCK" ]; then
+    echo "Снимок документации: не зафиксирован → sdd.sh snapshot --docs \"<файлы доки>\""
+    return
   fi
-
-  ensure_anchor "$ROOT/CLAUDE.md"
-  [ -f "$ROOT/AGENTS.md" ] && ensure_anchor "$ROOT/AGENTS.md"
-  [ "$GITIGNORE" = 1 ] && ensure_gitignore
-
-  say "### sdd-power init — $ROOT"
-  [ -n "$created" ]  && say "создано:   $created"
-  [ -n "$migrated" ] && say "перенесено:$migrated"
-  [ -n "$skipped" ]  && say "уже было:  $skipped"
-  say ""
-  cmd_check
-}
-
-ensure_anchor() {
-  local file="$1"
-  if [ -f "$file" ] && grep -qF "$ANCHOR_MARK" "$file"; then return 0; fi
-  { [ -f "$file" ] && printf '\n'
-    printf '%s\n' "$ANCHOR_MARK"
-    printf '%s\n' "## Состояние разработки"
-    printf '%s\n' "Проект ведётся по скиллу **sdd-power**. Активируй его в начале сессии и прочитай"
-    printf '%s\n' "\`docs/sdd-power/\` (PLAN.md, WORKLOG.md, TIMELINE.md, LESSONS.md, stages/) прежде,"
-    printf '%s\n' "чем писать код или отвечать по задачам проекта. Файлы обновляются синхронно с кодом."
-  } >> "$file"
-}
-
-ensure_gitignore() {
-  git_in_root || return 0
-  grep -qE '^docs/sdd-power/?$' "$ROOT/.gitignore" 2>/dev/null && return 0
-  { [ -s "$ROOT/.gitignore" ] && printf '\n'
-    printf '%s\n' "# рабочее состояние разработки (sdd-power)"
-    printf '%s\n' "docs/sdd-power/"
-  } >> "$ROOT/.gitignore"
-}
-
-# ---------- снимок документации ----------
-cmd_snapshot() {
-  have_tracking || die "нет файлов трекинга в $SDD — начни с 'sdd.sh init'"
-  [ -f "$CFG" ] || { printf 'project:\ndocs:\nsnapshot:\nrigor: full\ngit: tracked\n' > "$CFG"; }
-  local docs="$DOCS_ARG"
-  [ -n "$docs" ] || docs="$(cfg_get docs)"
-  [ -n "$docs" ] || die "не указаны файлы документации: sdd.sh snapshot --docs \"docs/ТЗ.md docs/api.md\""
-
-  local expanded="" n=0
-  cd "$ROOT" || die "не войти в $ROOT"
-  : > "$LOCK.tmp"
-  for pat in $docs; do
-    local matched=0
-    for f in $pat; do
-      [ -f "$f" ] || continue
-      printf '%s  %s\n' "$(sha256_of "$f")" "$f" >> "$LOCK.tmp"
-      expanded="$expanded $f"; n=$((n + 1)); matched=1
-    done
-    [ "$matched" = 0 ] && say "  [!] по шаблону «$pat» файлов не найдено"
-  done
-  [ "$n" = 0 ] && { rm -f "$LOCK.tmp"; die "ни одного файла документации не найдено"; }
-  mv "$LOCK.tmp" "$LOCK"
-  cfg_set docs "$docs"
-  cfg_set snapshot "$(date +%Y-%m-%d)"
-  say "снимок документации зафиксирован: $n файлов, дата $(date +%Y-%m-%d)"
-  say "не забудь ту же дату в шапке PLAN.md — валидатор сверяет их"
-}
-
-docs_drift() {   # печатает строки о дрейфе; код 1 — есть изменения
-  [ -f "$LOCK" ] || { say "  [i] снимок документации не зафиксирован — 'sdd.sh snapshot --docs \"...\"'"; return 0; }
-  local changed=0 missing=0 line hash path now
-  cd "$ROOT" || return 0
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    hash="${line%% *}"; path="${line#*  }"
-    if [ ! -f "$path" ]; then say "  [!] дока пропала: $path"; missing=$((missing + 1)); continue; fi
-    now="$(sha256_of "$path")"
-    [ "$now" = "$hash" ] || { say "  [!] дока изменилась с момента снимка: $path"; changed=$((changed + 1)); }
+  local changed=0 missing=0 h p cur
+  while IFS=$'\t' read -r h p; do
+    [ -n "${p:-}" ] || continue
+    if [ ! -f "$ROOT/$p" ]; then
+      echo "Документация: файл пропал — $p"
+      missing=$((missing+1)); continue
+    fi
+    cur=$(hash_file "$ROOT/$p")
+    if [ "$cur" != "$h" ]; then
+      echo "Документация ИЗМЕНИЛАСЬ с момента снимка: $p"
+      changed=$((changed+1))
+    fi
   done < "$LOCK"
-  if [ "$changed" -gt 0 ] || [ "$missing" -gt 0 ]; then
-    say "  → сравни изменившиеся разделы с планом, обнови задачи и снимок, зафиксируй ре-синхронизацию в WORKLOG,"
-    say "    затем 'sdd.sh snapshot' — работа по устаревшему плану так же опасна, как работа по ошибочной доке"
-    return 1
+  if [ $changed -eq 0 ] && [ $missing -eq 0 ]; then
+    echo "Документация: совпадает со снимком ($(grep -c . "$LOCK") файл(ов))"
+  else
+    echo "→ сравни изменившиеся разделы с планом, обнови задачи, запиши ре-синхронизацию в WORKLOG, затем sdd.sh snapshot"
   fi
-  say "  [ok]      документация не менялась с $(cfg_get snapshot)"
+}
+
+# ============================================================ validate
+run_validate() { # печатает находки; ставит N_ERR / N_WARN
+  local f
+  for f in $TRACK_FILES; do
+    [ -f "$SDD/$f" ] || { echo "ОШИБКА: нет файла docs/sdd-power/$f — запусти sdd.sh init"; N_ERR=1; N_WARN=0; return; }
+  done
+
+  local stagefiles=""
+  [ -d "$STAGES" ] && stagefiles=$(cd "$STAGES" && ls -1 *.md 2>/dev/null | tr '\n' ' ')
+
+  local out
+  out=$(awk -v stagefiles="$stagefiles" -f "$SCRIPT_DIR/validate.awk" \
+        "$PLAN" "$TIMELINE" "$WORKLOG" "$LESSONS")
+
+  # дата снимка: шапка PLAN.md против config.yml
+  local pdate cdate
+  pdate=$(grep -m1 -oE 'снимок от [^ ]+' "$PLAN" | sed 's/снимок от //')
+  cdate=$([ -f "$CONFIG" ] && grep -m1 -E '^snapshot_date:' "$CONFIG" | sed 's/^snapshot_date:[[:space:]]*//')
+  if [ -n "${pdate:-}" ] && [ -n "${cdate:-}" ] && [ "$pdate" != "$cdate" ] && [ "${pdate#<}" = "$pdate" ]; then
+    out="${out}"$'\n'"ПРЕДУПРЕЖДЕНИЕ: дата снимка в шапке PLAN.md ($pdate) не совпадает с config.yml ($cdate)"
+  fi
+
+  out=$(printf '%s\n' "$out" | grep -v '^$')
+  N_ERR=$(printf '%s\n' "$out" | grep -c '^ОШИБКА')
+  N_WARN=$(printf '%s\n' "$out" | grep -c '^ПРЕДУПРЕЖДЕНИЕ')
+  [ -n "$out" ] && printf '%s\n' "$out"
   return 0
 }
 
-# ---------- валидатор ----------
-run_validator() {
-  have_tracking || return 3
-  local stages tags hasgit=0
-  stages="$(ls "$SDD/stages" 2>/dev/null | sed -n 's/^\([0-9][0-9.]*\)-.*\.md$/\1/p' | tr '\n' ' ')"
-  if git_in_root; then hasgit=1; tags="$(git -C "$ROOT" tag -l 'stage/*' 2>/dev/null | sed 's|^stage/||' | tr '\n' ' ')"; fi
-  awk -f "$LIB/validate.awk" \
-      -v stages="$stages" -v tags="${tags:-}" -v hasgit="$hasgit" \
-      -v hascfg="$([ -f "$CFG" ] && echo 1 || echo 0)" -v snapdate="$(cfg_get snapshot)" \
-      "$SDD/PLAN.md" "$SDD/WORKLOG.md" "$SDD/TIMELINE.md" "$SDD/LESSONS.md"
-}
-
-print_findings() {   # $1 — вывод валидатора
-  local out="$1"
-  printf '%s\n' "$out" | grep '^ERR'  | sed 's/^ERR\t\([A-Z0-9-]*\)\t/  [ошибка]        [\1] /'
-  printf '%s\n' "$out" | grep '^WARN' | sed 's/^WARN\t\([A-Z0-9-]*\)\t/  [предупреждение] [\1] /'
-  printf '%s\n' "$out" | grep '^INFO' | sed 's/^INFO\t[A-Z0-9-]*\t/  [i] /'
+verdict() {
+  if [ "${N_ERR:-0}" -eq 0 ] && [ "${N_WARN:-0}" -eq 0 ]; then
+    echo "ВЕРДИКТ: трекинг без ошибок и предупреждений."
+  else
+    echo "ВЕРДИКТ: ошибок — ${N_ERR:-0}, предупреждений — ${N_WARN:-0}."
+    if [ "${N_ERR:-0}" -gt 0 ]; then
+      echo "Ошибки чини до кода. Предупреждения разбери и либо исправь, либо заведи задачу."
+    fi
+  fi
 }
 
 cmd_validate() {
-  local out; out="$(run_validator)"; local rc=$?
-  [ "$rc" = 3 ] && die "нет файлов трекинга в $SDD — начни с 'sdd.sh init'"
-  say "### sdd-power validate — $SDD"
-  print_findings "$out"
-  local e w
-  e=$(printf '%s\n' "$out" | grep -c '^ERR')
-  w=$(printf '%s\n' "$out" | grep -c '^WARN')
-  say ""
-  if [ "$e" -gt 0 ]; then say "ИТОГ: ошибок $e, предупреждений $w — ошибки чинятся до продолжения работы."; return 1; fi
-  [ "$w" -gt 0 ] && say "ИТОГ: ошибок нет, предупреждений $w — работать можно, но разбери их." || say "ИТОГ: трекинг непротиворечив."
-  return 0
+  echo "== Валидация трекинга: $SDD"
+  run_validate
+  verdict
 }
 
-# ---------- check ----------
 cmd_check() {
-  local fail=0
-  say "### sdd-power check — $ROOT"
-  mark() { if [ "$1" = ok ]; then say "  [ok]      $2"; else say "  [ОТСУТСТВУЕТ] $2"; fail=1; fi; }
+  echo "== Проверка сессии: $ROOT"
+  infra_report
+  echo
+  docs_drift
+  echo
+  if [ "${INFRA_OK:-0}" = 1 ]; then
+    run_validate
+    verdict
+  else
+    echo "Содержание не проверялось: сначала почини инфраструктуру."
+  fi
+}
 
-  [ -d "$SDD" ] && mark ok "docs/sdd-power/" || mark no "docs/sdd-power/"
-  [ -d "$SDD/stages" ] && mark ok "docs/sdd-power/stages/" || mark no "docs/sdd-power/stages/"
-  for f in "${TRACKED[@]}"; do
-    if [ -f "$SDD/$f.md" ]; then mark ok "docs/sdd-power/$f.md ($(wc -l < "$SDD/$f.md" | tr -d ' ') строк)"
-    else mark no "docs/sdd-power/$f.md"; fi
-  done
-  if grep -qsF "$ANCHOR_MARK" "$ROOT/CLAUDE.md"; then mark ok "якорь в CLAUDE.md"; else mark no "якорь в CLAUDE.md"; fi
-  if [ -f "$CFG" ]; then mark ok "config.yml"; else say "  [!] нет config.yml — 'sdd.sh init' добавит (снимок доки не отслеживается)"; fi
+# ============================================================ next
+cmd_next() {
+  [ -f "$PLAN" ] || refuse "Нет docs/sdd-power/PLAN.md — запусти: sdd.sh init"
+  echo "== Где остановились: $ROOT"
+  awk -f "$SCRIPT_DIR/next.awk" "$PLAN" "$TIMELINE"
+  echo
+  echo "Заготовка записи WORKLOG (новые записи — СВЕРХУ, под шапкой файла):"
+  cat <<EOF
 
-  local orphans=""
-  for f in "${TRACKED[@]}"; do
-    for cand in "$ROOT/$f.md" "$ROOT/docs/$f.md" "$ROOT/.sdd/$f.md" "$ROOT/sdd-power/$f.md"; do
-      [ -f "$cand" ] && orphans="$orphans ${cand#$ROOT/}"
+## [$(now)] — <краткий заголовок шага>
+
+- **Что сделано:**
+- **Коммит:** \`<короткий SHA>\`
+- **Проверено:**
+- **Решения и причины:**
+- **Отклонения от плана или документации:** нет
+- **Закрыто в PLAN.md:** нет
+- **Урок для LESSONS.md:** нет
+EOF
+}
+
+# ============================================================ snapshot
+cmd_snapshot() {
+  [ -d "$SDD" ] || refuse "Нет docs/sdd-power/ — запусти: sdd.sh init"
+  [ -n "$DOCS_ARG" ] || die "нужен список файлов документации: sdd.sh snapshot --docs \"docs/ТЗ.md docs/api.md\""
+  local p abs n=0
+  : > "$LOCK"
+  for p in $DOCS_ARG; do
+    for abs in "$ROOT"/$p; do
+      [ -f "$abs" ] || { echo "  пропущен (не файл): $p"; continue; }
+      printf '%s\t%s\n' "$(hash_file "$abs")" "${abs#$ROOT/}" >> "$LOCK"
+      echo "  зафиксирован: ${abs#$ROOT/}"
+      n=$((n+1))
     done
   done
-  [ -n "$orphans" ] && say "  [!] файлы трекинга вне docs/sdd-power/:$orphans — перенеси или удали"
-
-  if git_in_root; then
-    if grep -qsE '^docs/sdd-power/?$' "$ROOT/.gitignore"; then say "  [i] git: docs/sdd-power/ в .gitignore — файлы не переживут свежий клон"
-    else say "  [i] git: docs/sdd-power/ версионируется"; fi
-  else
-    say "  [i] git: не репозиторий — теги stage/<ID> недоступны, отметь это в PLAN.md"
-  fi
-  say "  [i] закрытых этапов в stages/: $(find "$SDD/stages" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
-
-  local drift=0
-  if have_tracking; then docs_drift || drift=1; fi
-
-  local out="" e=0 w=0
-  if have_tracking; then
-    out="$(run_validator)"
-    e=$(printf '%s\n' "$out" | grep -c '^ERR'); w=$(printf '%s\n' "$out" | grep -c '^WARN')
-    say ""
-    say "Содержание трекинга: ошибок $e, предупреждений $w"
-    printf '%s\n' "$out" | grep '^ERR' | sed 's/^ERR\t\([A-Z0-9-]*\)\t/  [ошибка] [\1] /'
-    [ "$w" -gt 0 ] && say "  (полный разбор: sdd.sh validate)"
-  fi
-
-  say ""
-  if [ "$fail" != 0 ]; then say "ИТОГ: инфраструктура НЕПОЛНА — выполни 'sdd.sh init'."; return 1; fi
-  if [ "$e" -gt 0 ]; then say "ИТОГ: инфраструктура на месте, но в трекинге $e ошибок — почини до продолжения."; return 1; fi
-  if [ "$drift" = 1 ]; then say "ИТОГ: инфраструктура на месте; документация разошлась со снимком — нужна ре-синхронизация."; return 0; fi
-  say "ИТОГ: инфраструктура на месте."
-  return 0
+  [ "$n" -gt 0 ] || die "ни одного файла документации не найдено по: $DOCS_ARG"
+  {
+    echo "# снимок документации sdd-power"
+    [ -n "$NAME" ] && echo "project: $NAME"
+    echo "snapshot_date: $(today)"
+    echo "docs:"
+    awk -F'\t' '{print "  - " $2}' "$LOCK"
+  } > "$CONFIG"
+  echo
+  echo "Снимок: $n файл(ов), дата $(today) → docs/sdd-power/config.yml + docs.lock"
+  echo "Поставь ту же дату в шапке PLAN.md («снимок от $(today)») — иначе validate сообщит о расхождении."
 }
 
-# ---------- next ----------
-cmd_next() {
-  have_tracking || die "нет файлов трекинга в $SDD — начни с 'sdd.sh init'"
-  say "### sdd-power next — $ROOT"
-  say ""
-  awk -f "$LIB/next.awk" "$SDD/TIMELINE.md" "$SDD/PLAN.md"
-  say ""
-  say "Перед работой: LESSONS.md — $(grep -c '\*\*Правило:\*\*' "$SDD/LESSONS.md" 2>/dev/null || echo 0) правил, читается целиком."
-  say "После шага — запись в WORKLOG.md сверху по шаблону:"
-  say ""
-  say "## [$(date +%Y-%m-%d\ %H:%M)] — <заголовок шага>"
-  say ""
-  say "- **Что сделано:**"
-  say "- **Коммит:** \`<sha>\` (или «не коммитилось»)"
-  say "- **Проверено:**"
-  say "- **Решения и причины:**"
-  say "- **Отклонения от плана или документации:**"
-  say "- **Закрыто в PLAN.md:**"
-  say "- **Урок для LESSONS.md:**"
-}
-
-# ---------- stage ----------
+# ============================================================ stage
 cmd_stage() {
-  [ -n "$ARG1" ] && [ -n "$ARG2" ] || die "использование: sdd.sh stage <ID> <slug>"
-  case "$ARG2" in *[!a-z0-9-]*|-*|*-) die "slug — строчные латинские буквы, цифры и дефисы: например 0-validation" ;; esac
-  [ -d "$SDD/stages" ] || die "нет $SDD/stages — выполни 'sdd.sh init'"
-  local target="$SDD/stages/$ARG1-$ARG2.md"
-  [ -f "$target" ] && die "уже существует: ${target#$ROOT/} — саммари этапа пишется один раз"
-  cp "$ASSETS/STAGE.template.md" "$target" || die "не удалось создать $target"
-  ID="$ARG1" perl -pi -e 's/<ID>/$ENV{ID}/g' "$target" 2>/dev/null || true
-  say "создан ${target#$ROOT/}"
-  say "дальше: заполнить (включая раздел «Верификация»), затем 'sdd.sh archive-tasks $ARG1',"
-  say "тег stage/$ARG1 и статус «завершён» в TIMELINE.md"
+  local id=${POS[0]:-} slug=${POS[1]:-}
+  [ -n "$id" ] && [ -n "$slug" ] || die "нужно: sdd.sh stage <ID> <slug>"
+  [ -f "$ASSETS/STAGE.template.md" ] || die "нет шаблона $ASSETS/STAGE.template.md"
+  mkdir -p "$STAGES"
+  local out="$STAGES/$id-$slug.md"
+  [ -f "$out" ] && refuse "Уже существует: ${out#$ROOT/} — заполняй его, а не пересоздавай."
+  local title
+  title=$(grep -m1 -E "^## Этап $id\." "$PLAN" 2>/dev/null | sed -E "s/^## Этап $id\.[[:space:]]*//")
+  [ -n "${title:-}" ] || title="<название>"
+  sed -e "s/<ID>/$id/g" -e "s/<название>/${title//\//\\/}/" -e "s/<ГГГГ-ММ-ДД>/$(today)/" \
+      "$ASSETS/STAGE.template.md" > "$out"
+  echo "Создан ${out#$ROOT/} — заполни разделы: что сделано, ключевые решения, отклонения, как проверить, важно знать дальше."
+  echo "Затем: sdd.sh archive-tasks $id"
 }
 
-# ---------- archive-tasks ----------
-cmd_archive_tasks() {
-  [ -n "$ARG1" ] || die "использование: sdd.sh archive-tasks <ID>"
-  have_tracking || die "нет файлов трекинга в $SDD"
-  local id="$ARG1" sum
-  sum="$(find "$SDD/stages" -maxdepth 1 -name "$id-*.md" 2>/dev/null | head -1)"
-  [ -n "$sum" ] || die "нет саммари docs/sdd-power/stages/$id-*.md — сначала 'sdd.sh stage $id <slug>'"
-  grep -q "^## Этап $id\." "$SDD/PLAN.md" || die "раздел «## Этап $id.» в PLAN.md не найден"
-  grep -q "Состав этапа перенесён" <(awk -v id="$id" '
-      index($0,"## Этап ")==1 { ins = (index($0,"## Этап " id ".")==1) }
-      ins { print }' "$SDD/PLAN.md") && die "состав этапа $id уже перенесён"
+# ============================================================ archive-tasks
+cmd_archive() {
+  local id=${POS[0]:-}
+  [ -n "$id" ] || die "нужно: sdd.sh archive-tasks <ID>"
+  [ -f "$PLAN" ] || die "нет $PLAN"
+  local sum
+  sum=$(ls -1 "$STAGES/$id"-*.md 2>/dev/null | head -1)
+  [ -n "${sum:-}" ] || refuse "Нет саммари для этапа $id — сначала: sdd.sh stage $id <slug>"
+  if grep -qF "## Состав этапа" "$sum"; then
+    echo "Состав этапа $id уже перенесён в ${sum#$ROOT/} — команда отрабатывает один раз, PLAN.md не тронут."
+    exit 0
+  fi
+  grep -qE "^## Этап $id\." "$PLAN" || refuse "В PLAN.md нет этапа $id — проверь номер."
 
-  local ref="stages/$(basename "$sum")" body
-  body="$(awk -f "$LIB/archive.awk" -v id="$id" -v mode=extract "$SDD/PLAN.md")" || die "не удалось извлечь раздел"
-  [ -n "$body" ] || die "раздел этапа $id пуст"
+  local open
+  open=$(awk -v id="$id" '
+    $0 ~ "^## Этап " id "\\." {inb=1; next}
+    inb && /^## / {inb=0}
+    inb && /^- \[[^x]\]/ {n++}
+    END{print n+0}' "$PLAN")
+  [ "$open" -gt 0 ] && echo "ПРЕДУПРЕЖДЕНИЕ: в этапе $id осталось незакрытых задач: $open — закрытого этапа с открытыми задачами не бывает."
 
-  cp "$SDD/PLAN.md" "$SDD/PLAN.md.bak"
-  { printf '\n---\n\n## Состав этапа (перенесено из PLAN.md %s)\n\n' "$(date +%Y-%m-%d)"
-    printf 'Задачи и их номера сохранены дословно: на них ссылаются WORKLOG.md и LESSONS.md.\n\n'
-    printf '%s\n' "$body"; } >> "$sum"
+  cp "$PLAN" "$PLAN.bak"
+  awk -v id="$id" -v sum="${sum#$ROOT/}" -v body="$SDD/.archive.tmp" '
+    BEGIN{inb=0}
+    $0 ~ "^## Этап " id "\\." {
+      print; print "<!-- закрыт: см. " sum ", тег stage/" id " -->"; print "";
+      inb=1; next
+    }
+    inb && (/^## / || /^---[-]*$/) {inb=0}
+    inb { print > body; next }
+    {print}
+  ' "$PLAN" > "$PLAN.new" || die "не удалось разобрать PLAN.md"
 
-  awk -f "$LIB/archive.awk" -v id="$id" -v mode=strip -v ref="$ref" "$SDD/PLAN.md" > "$SDD/PLAN.md.tmp" \
-    || { rm -f "$SDD/PLAN.md.tmp"; die "не удалось переписать PLAN.md (копия цела: PLAN.md.bak)"; }
-  mv "$SDD/PLAN.md.tmp" "$SDD/PLAN.md"
+  {
+    echo
+    echo "## Состав этапа"
+    echo
+    echo "Архив задач этапа из PLAN.md — номера сохранены дословно, на них ссылаются WORKLOG и LESSONS."
+    echo
+    sed '/^[[:space:]]*$/{N;/^\n[[:space:]]*$/D}' "$SDD/.archive.tmp"
+  } >> "$sum"
 
-  say "состав этапа $id перенесён в ${sum#$ROOT/}"
-  say "в PLAN.md осталась заглушка со ссылкой; резервная копия — docs/sdd-power/PLAN.md.bak"
-  say "PLAN.md: было $(wc -l < "$SDD/PLAN.md.bak" | tr -d ' ') строк, стало $(wc -l < "$SDD/PLAN.md" | tr -d ' ')"
+  mv "$PLAN.new" "$PLAN"
+  rm -f "$SDD/.archive.tmp"
+  echo "Состав этапа $id перенесён в ${sum#$ROOT/}; в PLAN.md остался заголовок со ссылкой."
+  echo "Резервная копия: docs/sdd-power/PLAN.md.bak"
+  echo "Дальше: git-тег stage/$id, статус в TIMELINE.md, затем sdd.sh validate."
+}
+
+# ============================================================ help
+cmd_help() {
+  sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 case "$CMD" in
-  init)          cmd_init ;;
-  check)         cmd_check ;;
-  validate)      cmd_validate ;;
-  next)          cmd_next ;;
-  snapshot)      cmd_snapshot ;;
-  stage)         cmd_stage ;;
-  archive-tasks) cmd_archive_tasks ;;
-  help|--help|-h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "неизвестная команда: $CMD (см. sdd.sh help)" ;;
+  init) cmd_init ;;
+  check) cmd_check ;;
+  next) cmd_next ;;
+  validate) cmd_validate ;;
+  snapshot) cmd_snapshot ;;
+  stage) cmd_stage ;;
+  archive-tasks) cmd_archive ;;
+  help|--help|-h) cmd_help ;;
+  *) echo "неизвестная команда: $CMD"; cmd_help; exit 2 ;;
 esac
+
+exit 0
